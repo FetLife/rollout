@@ -78,22 +78,14 @@ class Rollout
       }
     end
 
+    def user_in_percentage?(user)
+      Zlib.crc32(user_id_for_percentage(user)) < RAND_BASE * @percentage
+    end
+
     private
 
     def user_id(user)
-      if user.is_a?(Integer) || user.is_a?(String)
-        user.to_s
-      else
-        user.send(id_user_by).to_s
-      end
-    end
-
-    def id_user_by
-      @options[:id_user_by] || :id
-    end
-
-    def user_in_percentage?(user)
-      Zlib.crc32(user_id_for_percentage(user)) < RAND_BASE * @percentage
+      Rollout.user_id(user, @options[:id_user_by])
     end
 
     def user_id_for_percentage(user)
@@ -135,6 +127,14 @@ class Rollout
     end
   end
 
+  def self.user_id(user, id_user_by = nil)
+    if user.is_a?(Integer) || user.is_a?(String)
+      user.to_s
+    else
+      user.send(id_user_by || :id).to_s
+    end
+  end
+
   def initialize(storage, opts = {})
     @storage = storage
     @options = opts
@@ -152,10 +152,16 @@ class Rollout
   end
 
   def delete(feature)
+    origin_feature = get(feature)
+    changed_feature = Feature.new(feature)
     features = (@storage.get(features_key) || '').split(',')
     features.delete(feature.to_s)
-    @storage.set(features_key, features.join(','))
-    @storage.del(key(feature))
+
+    @storage.multi do
+      reindex(origin_feature, changed_feature)
+      @storage.set(features_key, features.join(','))
+      @storage.del(key(feature))
+    end
   end
 
   def set(feature, desired_state)
@@ -274,18 +280,29 @@ class Rollout
     (@storage.get(features_key) || '').split(',').map(&:to_sym)
   end
 
+  def groups_user_belongs_to(user = nil)
+    return [@groups.keys.first] if user.nil?
+
+    groups = @groups.select do |group, _|
+      active_in_group?(group, user)
+    end.keys
+  end
+
   def feature_states(user = nil)
-    multi_get(*features).each_with_object({}) do |f, hash|
-      hash[f.name] = f.active?(self, user)
+    features_activated = active_features(user)
+    features.each_with_object({}) do |f, hash|
+      hash[f] = features_activated.include?(f) 
     end
   end
 
   def active_features(user = nil)
-    multi_get(*features).select do |f|
-      f.active?(self, user)
-    end.map(&:name)
+    features = active_features_by_groups(user) +
+      active_features_by_percentage(user)
+    return features if user.nil?
+  
+    features + active_features_by_users(user)
   end
-
+  
   def clear!
     features.each do |feature|
       with_feature(feature, &:clear)
@@ -299,10 +316,76 @@ class Rollout
     @storage.exists(key(feature))
   end
 
+  def reindex_all
+    users              = {}
+    groups             = {}
+    percentages_of_100 = [] 
+    percentages        = [] 
+
+    multi_get(*features).select do |feature|
+      feature.users.each do |user|
+        users[user] ||= []
+        users[user].push(feature.name)
+      end
+
+      feature.groups.each do |group|
+        groups[group] ||= []
+        groups[group].push(feature.name)
+      end
+
+      percentages_of_100.push(feature.name) if feature.percentage == 100 
+      percentages.push(feature.name)        if feature.percentage < 100  && feature.percentage > 0 
+    end
+
+    @storage.multi do
+      users.each do |user, features|
+        @storage.del(field_index("users:#{user}"))
+        @storage.sadd(field_index("users:#{user}"), features) if features.size > 0
+      end
+
+      groups.each do |group, features|
+        @storage.del(field_index("groups:#{group}"))
+        @storage.sadd(field_index("groups:#{group}"), features) if features.size > 0
+      end
+
+      @storage.del(field_index("percentage:100"))
+      @storage.sadd(field_index("percentage:100"), percentages_of_100) if percentages_of_100.size > 0
+      @storage.del(field_index("percentage"))
+      @storage.sadd(field_index("percentage"), percentages) if percentages.size > 0
+    end
+  end
+
   private
+
+  def active_features_by_groups(user)
+    groups_user_belongs_to(user).inject([]) do |result, group| 
+      result += @storage.smembers(field_index("groups:#{group}"))
+    end.map(&:to_sym)
+  end
+
+  def active_features_by_users(user)
+    @storage.smembers(field_index("users:#{user_id(user)}")).map(&:to_sym)
+  end
+
+  def active_features_by_percentage(user)
+    features = @storage.smembers(percentage_field_index(100)).map(&:to_sym)
+    return features if user.nil?
+
+    features + @storage.smembers(percentage_field_index).select do |feature_name|
+      get(feature_name).user_in_percentage?(user)
+    end.map(&:to_sym)
+  end
+
+  def user_id(user)
+    Rollout.user_id(user, @options[:id_user_by])
+  end
 
   def key(name)
     "feature:#{name}"
+  end
+
+  def field_index(name)
+    "indices:#{name}"
   end
 
   def features_key
@@ -315,8 +398,56 @@ class Rollout
     save(f)
   end
 
+  def percentage_field_index(percentage = nil)
+    field = case percentage 
+      when 100
+        ":100"
+      when 0 
+        ":disabled"
+      else
+        ""
+    end
+
+   field_index("percentage#{field}")
+  end
+
+  def reindex_percentage(origin_feature, changed_feature)
+    return if origin_feature.percentage == changed_feature.percentage 
+    changed_field_name =  percentage_field_index(changed_feature.percentage)
+    origin_field_name = percentage_field_index(origin_feature.percentage)
+    return if changed_field_name == origin_field_name
+
+    @storage.sadd(changed_field_name, changed_feature.name)  unless changed_feature.percentage == 0
+    return if origin_feature.percentage == 0 
+    @storage.srem(origin_field_name, changed_feature.name) 
+  end
+
+  def reindex_field(origin_feature, changed_feature, name) 
+    activated_keys = changed_feature.send(name) - origin_feature.send(name)
+    deactivated_keys = origin_feature.send(name) - changed_feature.send(name) 
+
+    activated_keys.each do |key|
+      @storage.sadd(field_index("#{name}:#{key}"), changed_feature.name)
+    end
+    deactivated_keys.each do |key|
+      @storage.srem(field_index("#{name}:#{key}"), changed_feature.name)
+    end
+  end
+
+  def reindex(origin_feature, changed_feature)
+    reindex_field(origin_feature, changed_feature, "users")
+    reindex_field(origin_feature, changed_feature, "groups")
+    reindex_percentage(origin_feature, changed_feature)
+  end
+
   def save(feature)
-    @storage.set(key(feature.name), feature.serialize)
-    @storage.set(features_key, (features | [feature.name.to_sym]).join(','))
+    origin_feature  = get(feature.name)
+    origin_features = features
+
+    @storage.multi do
+      reindex(origin_feature, feature)
+      @storage.set(key(feature.name), feature.serialize)
+      @storage.set(features_key, (origin_features | [feature.name.to_sym]).join(','))
+    end
   end
 end

@@ -413,6 +413,158 @@ RSpec.describe "Rollout" do
     end
   end
 
+  describe "indexes all related fields of feature" do
+    let(:user)     { double(id: 42) }
+    let(:features) { %i(chat blog) }
+
+    context "when users was changed" do
+      before do
+        features.each do |feature|
+          @rollout.activate_user(feature, user)
+        end
+      end
+
+      it "adds the new feature to the user index" do
+        @rollout.activate_user(:video, user)
+        index_key = @rollout.send("field_index", "users:#{user.id}")
+        expect(@redis.sismember(index_key, :video)).to be_truthy
+      end
+
+      it "removes the new feature from the user index" do
+        @rollout.deactivate_user(features[0], user)
+        index_key = @rollout.send("field_index", "users:#{user.id}")
+        expect(@redis.sismember(index_key, features[0])).to be_falsey
+      end
+    end
+
+    context "when groups was changed" do
+      let(:group) { :caretakers }
+
+      before do
+        features.each do |feature|
+          @rollout.activate_group(feature, group)
+        end
+      end
+
+      it "adds the new group to the group index" do
+        @rollout.activate_group(:video, group)
+        index_key = @rollout.send("field_index", "groups:#{group}")
+        expect(@redis.sismember(index_key, :video)).to be_truthy
+      end
+
+      it "removes the group from the group index" do
+        @rollout.deactivate_group(features[0], group)
+        index_key = @rollout.send("field_index", "groups:#{group}")
+        expect(@redis.sismember(index_key, features[0])).to be_falsey
+      end
+    end
+
+    context "when percentage was changed" do
+      let(:feature) { :blog }
+      let(:percentage_key_100) { @rollout.send("percentage_field_index", 100) }
+      let(:percentage_key_normal) { @rollout.send("percentage_field_index") }
+
+      context "when the percentage was 100" do
+        before do
+          @rollout.activate_percentage(feature, 100) 
+        end
+
+        it "set the feature into 100 percentage index" do
+          expect(@redis.sismember(percentage_key_100, feature)).to be_truthy
+        end
+
+        context "when changed the percentage to 85" do
+          it "moves the feature to the normal percentage index" do
+            @rollout.activate_percentage(feature, 85) 
+            expect(@redis.sismember(percentage_key_100, feature)).to be_falsy
+            expect(@redis.sismember(percentage_key_normal, feature)).to be_truthy
+          end
+        end
+
+        context "when changed the percentage to 0" do
+          it "removes the feature from all percentage index" do
+            @rollout.activate_percentage(feature, 0) 
+            expect(@redis.sismember(percentage_key_100, feature)).to be_falsy
+            expect(@redis.sismember(percentage_key_normal, feature)).to be_falsy
+          end
+        end
+      end
+
+      context "when the percentage was 85" do
+        before do
+          @rollout.activate_percentage(feature, 85) 
+        end
+
+        it "set the feature into normal percentage index" do
+          expect(@redis.sismember(percentage_key_normal, feature)).to be_truthy
+        end
+
+        context "when changed the percentage to 95" do
+          it "moves the feature to the normal percentage index" do
+            @rollout.activate_percentage(feature, 95) 
+            expect(@redis.sismember(percentage_key_100, feature)).to be_falsy
+            expect(@redis.sismember(percentage_key_normal, feature)).to be_truthy
+          end
+        end
+
+        context "when changed the percentage to 100" do
+          it "removes the feature from all percentage index" do
+            @rollout.activate_percentage(feature, 100) 
+            expect(@redis.sismember(percentage_key_100, feature)).to be_truthy
+            expect(@redis.sismember(percentage_key_normal, feature)).to be_falsy
+          end
+        end
+
+        context "when changed the percentage to 0" do
+          it "removes the feature from all percentage index" do
+            @rollout.activate_percentage(feature, 0) 
+            expect(@redis.sismember(percentage_key_100, feature)).to be_falsy
+            expect(@redis.sismember(percentage_key_normal, feature)).to be_falsy
+          end
+        end
+      end
+
+      context "when the feature was deleted" do
+        before do
+          @rollout.activate_group(feature, :alpha)
+          @rollout.activate_percentage(feature, 10)
+          @rollout.activate_user(feature, user)
+        end
+
+        it "empty all of indices" do
+          @rollout.delete(feature)
+          expect(@redis.exists(@rollout.send("field_index", "users:#{user.id}"))).to be_falsey
+          expect(@redis.exists(@rollout.send("field_index", "groups:alpha"))).to be_falsey
+          expect(@redis.exists(@rollout.send("field_index", @rollout.send("percentage_field_index")))).to be_falsey
+        end
+      end
+
+      context "when features created by earlier version" do
+        let(:group)           { :reindexed_group }
+        let(:grouped_feature) { :grouped_feature }
+        let(:global_feature)  { :feature_100_percent }
+
+        before do
+          allow(@rollout).to receive(:reindex).and_return(nil)
+          @rollout.define_group(group) do |user|
+            user.id == 42
+          end
+
+          features.each do |feature|
+            @rollout.activate_user(feature, user)
+          end
+          @rollout.activate_group(grouped_feature, group)
+          @rollout.activate_percentage(global_feature, 100)
+        end
+
+        it "reindex all of features" do
+          @rollout.reindex_all
+          expect(@rollout.active_features(user)).to contain_exactly(*features, grouped_feature, global_feature)
+        end
+      end
+    end
+  end
+
   describe "#get" do
     before do
       @rollout.activate_percentage(:chat, 10)
@@ -573,6 +725,19 @@ RSpec.describe "Rollout" do
     end
   end
 
+  describe "#groups_user_belongs_to" do
+    let(:user) { double(id: 5, level: 4) }
+    before do
+      @rollout.define_group(:alpha) { |user| user.level > 5 }
+      @rollout.define_group(:beta) { |user| user.level > 3 }
+      @rollout.define_group(:gama) { |user| user.level > 1 }
+    end
+
+    it "returns an array conatins groups the user blogns to" do
+      expect(@rollout.groups_user_belongs_to(user)).to match_array([:all, :beta, :gama])
+    end
+  end
+
   describe "#user_in_active_users?" do
     it "returns true if activated for user" do
       @rollout.activate_user(:chat, double(id: 5))
@@ -651,6 +816,22 @@ RSpec.describe "Rollout" do
       @rollout.set_feature_data(:chat, "|call||text|" => "a|bunch|of|stuff")
       expect(@rollout.get(:chat).data).to include("|call||text|" => "a|bunch|of|stuff")
       expect(@rollout.active?(:chat, user)).to be true
+    end
+  end
+
+  describe "#user_id" do
+    let(:user) { double(id: "12", email: "test@test.com") }
+
+    it "returns a string" do
+      expect(Rollout.user_id(123)).to be_a(String) 
+    end
+
+    it "extracts the id attribute as user id" do
+      expect(Rollout.user_id(user)).to be(user.id) 
+    end
+
+    it "extracts the specific attribute as user id" do
+      expect(Rollout.user_id(user, "email")).to be(user.email) 
     end
   end
 
