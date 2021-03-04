@@ -189,6 +189,7 @@ This example would use the "development:feature:chat:groups" key.
 *   PHP: https://github.com/opensoft/rollout
 *   Clojure: https://github.com/yeller/shoutout
 *   Perl: https://metacpan.org/pod/Toggle
+*   Golang: https://github.com/SalesLoft/gorollout
 
 
 ## Contributors
