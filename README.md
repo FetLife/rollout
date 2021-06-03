@@ -161,6 +161,15 @@ deactivate them automatically when a threshold is reached to prevent service
 failures from cascading. See https://github.com/jamesgolick/degrade for the
 failure detection code.
 
+## Check Rollout Feature
+
+You can inspect the state of your feature using:
+
+```ruby
+>> $rollout.get(:chat)
+=> #<Rollout::Feature:0x00007f99fa4ec528 @data={}, @groups=[:caretakers], @name=:chat, @options={}, @percentage=0.05, @users=["1"]>
+```
+
 ## Namespacing
 
 Rollout separates its keys from other keys in the data store using the
